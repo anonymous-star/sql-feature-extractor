@@ -184,3 +184,282 @@ collected 118 items
 
 - Python 3.8+
 - sqlglot 20.0+
+
+---
+
+---
+
+# SQL Clustering Guide
+
+SQL 쿼리를 구조적 특성 기반으로 클러스터링하는 가이드입니다.
+`sql_clustering.py` 의 `SQLClusteringPipeline` 을 사용합니다.
+
+## 추가 의존성 설치
+
+```bash
+pip install scikit-learn joblib tqdm numpy pandas pyarrow
+```
+
+---
+
+## 파이프라인 구조
+
+```
+SQL 이터러블
+    │
+    ▼
+병렬 Feature 추출 (joblib, chunk 단위)
+    │  50개 구조적 특성 → float32 행렬 (N × 50)
+    ▼
+StandardScaler 정규화
+    │
+    ▼
+PCA 차원 축소 (선택, 50 → 20차원)
+    │  클러스터링 속도 향상
+    ▼
+MiniBatchKMeans 클러스터링
+    │  1회 데이터 스캔, 10M+ 대응
+    ▼
+클러스터 레이블 (N,) + 프로파일 분석
+```
+
+---
+
+## 빠른 시작
+
+```python
+from sql_clustering import SQLClusteringPipeline
+
+pipeline = SQLClusteringPipeline(n_clusters=10)
+
+sql_list = [
+    "SELECT id FROM users WHERE age > 30",
+    "SELECT dept, COUNT(*) FROM emp GROUP BY dept",
+    "SELECT * FROM a JOIN b ON a.id = b.id",
+    # ...
+]
+
+X, labels = pipeline.fit_from_sqls(sql_list)
+print(pipeline.summary(X, labels))
+```
+
+---
+
+## 천만 건 대용량 처리
+
+### 핵심 설정
+
+```python
+pipeline = SQLClusteringPipeline(
+    n_clusters   = 30,          # 클러스터 수
+    algorithm    = "minibatch_kmeans",  # 10M+ 권장
+    use_pca      = True,        # 차원 축소로 속도 향상
+    pca_components = 20,        # 축소 목표 차원
+    chunk_size   = 50_000,      # 청크당 SQL 수
+    n_jobs       = -1,          # CPU 전체 코어 사용
+)
+```
+
+### DB 커서 / 파일 연동
+
+```python
+# DB 커서 (전체 데이터를 메모리에 올리지 않고 스트리밍)
+import psycopg2
+
+conn = psycopg2.connect(DSN)
+cur = conn.cursor("server_side_cursor")  # 서버 사이드 커서
+cur.execute("SELECT query_text FROM query_log")
+
+def sql_generator():
+    for row in cur:
+        yield row[0]
+
+X, labels = pipeline.fit_from_sqls(
+    sql_generator(),
+    total=10_000_000,           # tqdm 진행률 표시용
+    feature_cache="features.npz",  # 추출 결과 캐시
+)
+```
+
+```python
+# 파일 (한 줄에 SQL 1개)
+def file_generator(path):
+    with open(path) as f:
+        for line in f:
+            yield line.strip()
+
+X, labels = pipeline.fit_from_sqls(
+    file_generator("sqls.txt"),
+    feature_cache="features.npz",
+)
+```
+
+### feature 캐시 활용
+
+```python
+# 첫 실행: 추출 후 .npz 로 저장
+X, labels = pipeline.fit_from_sqls(sqls, feature_cache="features.npz")
+
+# 재실행: 캐시에서 즉시 로드 (추출 생략)
+X, labels = pipeline.fit_from_sqls(sqls, feature_cache="features.npz")
+# [cache] 기존 feature 파일 로드: features.npz
+```
+
+---
+
+## 최적 클러스터 수(k) 탐색
+
+클러스터 수를 모를 때 Elbow 분석으로 결정합니다.
+
+```python
+pipeline = SQLClusteringPipeline()
+X = pipeline.extract_features(sqls, feature_cache="features.npz")
+
+elbow_df = pipeline.find_optimal_k(
+    X,
+    k_range    = range(5, 51, 5),   # 5, 10, 15 ... 50
+    sample_size = 100_000,           # 샘플에서 계산 (빠름)
+)
+print(elbow_df)
+```
+
+출력 예시:
+
+```
+  k      inertia
+  5   8423.12
+ 10   5201.44
+ 15   3987.23     ← inertia 감소폭이 둔해지는 지점 선택
+ 20   3812.10
+ 25   3790.55
+```
+
+inertia 감소폭이 크게 줄어드는 **elbow point** 를 `n_clusters` 로 사용합니다.
+
+---
+
+## 알고리즘 선택
+
+| 알고리즘 | 속도 | 품질 | 권장 규모 |
+|----------|------|------|-----------|
+| `minibatch_kmeans` | 매우 빠름 | 보통 | **10M+ 권장** |
+| `bisecting_kmeans` | 보통 | 우수 | ~수백만 건 |
+
+```python
+# 수백만 건 이하: 품질 우선
+pipeline = SQLClusteringPipeline(algorithm="bisecting_kmeans", n_clusters=20)
+
+# 천만 건 이상: 속도 우선
+pipeline = SQLClusteringPipeline(algorithm="minibatch_kmeans", n_clusters=20)
+```
+
+---
+
+## 클러스터 분석 및 해석
+
+### 전체 요약
+
+```python
+summary = pipeline.summary(X, labels)
+print(summary)
+```
+
+```
+         size   ratio               top_features  avg_tables  avg_joins  avg_depth
+cluster
+2        3821  0.382   has_where, is_select, ...        1.12       0.00       0.00
+0        2145  0.215   has_aggregation, has_count       1.00       0.00       0.00
+1        1834  0.183   has_join, has_inner_join, ...    2.67       1.43       0.00
+3        1200  0.120   has_subquery, has_in, ...        2.10       0.00       1.25
+```
+
+| 컬럼 | 설명 |
+|------|------|
+| `size` | 클러스터 내 SQL 수 |
+| `ratio` | 전체 대비 비율 |
+| `top_features` | 평균값이 높은 상위 3개 feature |
+| `avg_tables` | 평균 참조 테이블 수 |
+| `avg_joins` | 평균 JOIN 수 |
+| `avg_depth` | 평균 서브쿼리 중첩 깊이 |
+
+### 특정 클러스터 상세 분석
+
+```python
+pipeline.describe_cluster(X, labels, cluster_id=1, top_n=10)
+```
+
+```
+[Cluster 1]  size=1,834 (18.3%)
+has_join          1.000000
+has_inner_join    0.821000
+num_tables        2.670000
+has_select        1.000000
+join_count        1.430000
+...
+```
+
+### feature 프로파일 전체 조회
+
+```python
+profiles = pipeline.cluster_profiles(X, labels)
+# index=cluster_id, columns=feature_cols + size + ratio
+print(profiles[["num_tables", "join_count", "has_aggregation", "subquery_depth"]])
+```
+
+---
+
+## 파이프라인 저장 / 로드
+
+```python
+# 학습 완료 후 저장
+pipeline.save("sql_pipeline.joblib")
+
+# 나중에 로드해서 새 SQL 분류
+from sql_clustering import SQLClusteringPipeline
+
+pipeline = SQLClusteringPipeline.load("sql_pipeline.joblib")
+
+new_sqls = ["SELECT COUNT(*) FROM orders GROUP BY status"]
+X_new    = pipeline.extract_features(new_sqls)
+labels   = pipeline.predict(X_new)
+print(labels)   # [2]
+```
+
+---
+
+## 파라미터 튜닝 가이드
+
+| 상황 | 권장 설정 |
+|------|-----------|
+| 10M+ 쿼리, 빠른 처리 우선 | `algorithm="minibatch_kmeans"`, `use_pca=True`, `n_jobs=-1` |
+| 수백만 건, 품질 우선 | `algorithm="bisecting_kmeans"`, `use_pca=False` |
+| 클러스터 수 모름 | `find_optimal_k()` 로 elbow 분석 후 결정 |
+| 재현성 필요 | `random_state=42` 고정 |
+| 메모리 부족 | `chunk_size` 축소 (예: 10_000) |
+| 처리 느림 | `chunk_size` 확대 (예: 100_000), `n_jobs=-1` |
+
+---
+
+## 테스트 실행
+
+```bash
+pytest test_sql_clustering.py -v
+```
+
+### 테스트 구성 (61개)
+
+| 클래스 | 테스트 수 | 검증 내용 |
+|--------|-----------|-----------|
+| `TestUtils` | 7 | 청크 분할, feature 추출 형태/타입 |
+| `TestFeatureCols` | 4 | 50개 컬럼, 중복 없음 |
+| `TestExtractFeatures` | 12 | shape/dtype, 캐시, 제너레이터, 청크 경계 |
+| `TestFitPredict` | 11 | 모델 세팅, 레이블 범위, 결정론성, 알고리즘 분기 |
+| `TestFitFromSqls` | 4 | 반환 타입/shape, 캐시 연동 |
+| `TestClusterAnalysis` | 10 | 프로파일 shape, size 합계, ratio 합=1.0 |
+| `TestFindOptimalK` | 5 | DataFrame 반환, inertia 단조감소 |
+| `TestSaveLoad` | 5 | 저장/로드, 예측 일치, 하이퍼파라미터 보존 |
+| `TestClusteringQuality` | 3 | 유사 SQL 동일 클러스터, DML/SELECT 분리 |
+
+```
+61 passed in 4.64s
+```
